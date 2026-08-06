@@ -10,7 +10,16 @@ from math import cos, sin, pi
 import time
 import numpy as np
 import matplotlib
-matplotlib.use('Qt5Agg')
+import os
+
+# Use non-interactive backend if no display is available
+if os.environ.get('MPLBACKEND') == 'Agg' or not os.environ.get('DISPLAY'):
+    matplotlib.use('Agg')
+    _HEADLESS = True
+else:
+    matplotlib.use('Qt5Agg')
+    _HEADLESS = False
+
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 
@@ -101,14 +110,18 @@ class MultiRoboMasterSim(Node):
         self.timer = self.create_timer(self.DT, self.update_and_publish)
         self.get_logger().info(f"Simulator started for robots: {self.ROBOT_IDS}")
 
-        # Plots
+        # Plots (skip if headless)
+        self._headless = _HEADLESS
         self.figure = []
         self.axes = []
         self.patches_robots = {rid: [] for rid in self.ROBOT_IDS}
         self.patches_grippers = {rid: [] for rid in self.ROBOT_IDS}
         self.text_ids = {rid: [] for rid in self.ROBOT_IDS}
-        self.__init_plot()
-        self.__update_plot()
+        if not self._headless:
+            self.__init_plot()
+            self.__update_plot()
+        else:
+            self.get_logger().info("Running in headless mode (no plot)")
     
     def __init_plot(self):
         self.figure, self.axes = plt.subplots()
@@ -288,7 +301,8 @@ class MultiRoboMasterSim(Node):
             
             self.pubs[rid].publish(msg)
 
-        self.__update_plot()
+        if not self._headless:
+            self.__update_plot()
 
 def main(args=None):
     rclpy.init(args=args)
