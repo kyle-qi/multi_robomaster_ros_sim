@@ -1,9 +1,13 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from geometry_msgs.msg import Twist, PoseStamped
+from rclpy.action import ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
+from geometry_msgs.msg import Twist, PoseStamped, Point
 from std_msgs.msg import ColorRGBA
+from robomaster_msgs.action import GripperControl
 from math import cos, sin, pi
+import time
 import numpy as np
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -31,11 +35,22 @@ class MultiRoboMasterSim(Node):
         self.ROBOT_SIZE = [0.24, 0.32] # [w, l]
         self.GRIPPER_SIZE = 0.1
         
+        # Gripper / arm constants
+        self.GRIPPER_OPEN = 1
+        self.GRIPPER_CLOSED = 2
+        self.ARM_MAX_EXTENSION = 0.2  # max forward extension in meters
+        self.GRIPPER_OPEN_WIDTH = self.GRIPPER_SIZE  # visual width when open
+        self.GRIPPER_CLOSED_WIDTH = self.GRIPPER_SIZE * 0.3  # visual width when closed
+
         # State: [x, y, theta]
         self.states = {}
         self.leds = {}
         self.velocities = {rid: np.array([0.0, 0.0, 0.0]) for rid in self.ROBOT_IDS}
         self.last_cmd_time = {rid: self.get_clock().now() for rid in self.ROBOT_IDS}
+
+        # Gripper and arm state per robot
+        self.gripper_states = {rid: self.GRIPPER_OPEN for rid in self.ROBOT_IDS}
+        self.arm_positions = {rid: np.array([0.0, 0.0, 0.0]) for rid in self.ROBOT_IDS}  # x, y, z
         
         # Initialize robots randomly
         for i, rid in enumerate(self.ROBOT_IDS):
@@ -50,7 +65,10 @@ class MultiRoboMasterSim(Node):
         self.pubs = {}
         self.subs_vel = {}
         self.subs_led = {}
+        self.subs_arm = {}
+        self.gripper_action_servers = {}
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=1)
+        self._action_group = ReentrantCallbackGroup()
 
         for rid in self.ROBOT_IDS:
             # Publisher: Mimics VRPN motion capture system
@@ -66,6 +84,19 @@ class MultiRoboMasterSim(Node):
             self.subs_led[rid] = self.create_subscription(
                 ColorRGBA, f'/robot{rid}/leds/color', 
                 lambda msg, rid=rid: self.led_callback(msg, rid), qos)
+
+            # Subscriber: Listen to the controller's target arm position
+            self.subs_arm[rid] = self.create_subscription(
+                Point, f'/robot{rid}/target_arm_position',
+                lambda msg, rid=rid: self.arm_callback(msg, rid), qos)
+
+            # Action Server: Gripper control
+            self.gripper_action_servers[rid] = ActionServer(
+                self,
+                GripperControl,
+                f'/robot{rid}/gripper',
+                lambda goal_handle, rid=rid: self.gripper_execute_callback(goal_handle, rid),
+                callback_group=self._action_group)
 
         self.timer = self.create_timer(self.DT, self.update_and_publish)
         self.get_logger().info(f"Simulator started for robots: {self.ROBOT_IDS}")
@@ -126,20 +157,46 @@ class MultiRoboMasterSim(Node):
                                       [-self.ROBOT_SIZE[1] / 2.0, self.ROBOT_SIZE[0] / 2.0],
                                       [-self.ROBOT_SIZE[1] / 2.0, -self.ROBOT_SIZE[0] / 2.0],
                                       [self.ROBOT_SIZE[1] / 2.0, -self.ROBOT_SIZE[0] / 2.0]]) @ R.T)
-            xy_gripper = t + (np.array([[self.ROBOT_SIZE[1] / 2.0, -self.GRIPPER_SIZE / 2.0],
-                                        [self.ROBOT_SIZE[1] / 2.0, self.GRIPPER_SIZE / 2.0],
-                                        [self.ROBOT_SIZE[1] / 2.0 + self.GRIPPER_SIZE, self.GRIPPER_SIZE / 2.0],
-                                        [self.ROBOT_SIZE[1] / 2.0 + self.GRIPPER_SIZE, 0.8 * self.GRIPPER_SIZE / 2.0],
-                                        [self.ROBOT_SIZE[1] / 2.0, 0.8 * self.GRIPPER_SIZE / 2.0],
-                                        [self.ROBOT_SIZE[1] / 2.0, -0.8 * self.GRIPPER_SIZE / 2.0],
-                                        [self.ROBOT_SIZE[1] / 2.0 + self.GRIPPER_SIZE, -0.8 * self.GRIPPER_SIZE / 2.0],
-                                        [self.ROBOT_SIZE[1] / 2.0 + self.GRIPPER_SIZE, -self.GRIPPER_SIZE / 2.0],
-                                        [self.ROBOT_SIZE[1] / 2.0, -self.GRIPPER_SIZE / 2.0]]) @ R.T)
+
+            # Gripper visual depends on arm extension and gripper state
+            arm_ext = self.arm_positions[rid][0]  # forward extension from arm x
+            gripper_offset = self.ROBOT_SIZE[1] / 2.0 + arm_ext
+
+            if self.gripper_states[rid] == self.GRIPPER_CLOSED:
+                # Closed gripper: narrow gap between fingers
+                gap = self.GRIPPER_SIZE * 0.1
+            else:
+                # Open gripper: full gap
+                gap = self.GRIPPER_SIZE * 0.8
+
+            half_gap = gap / 2.0
+            finger_width = (self.GRIPPER_SIZE - gap) / 2.0
+
+            # Draw a U-shaped gripper with two fingers
+            xy_gripper = t + (np.array([
+                [gripper_offset, -self.GRIPPER_SIZE / 2.0],
+                [gripper_offset, -half_gap],
+                [gripper_offset + self.GRIPPER_SIZE, -half_gap],
+                [gripper_offset + self.GRIPPER_SIZE, -self.GRIPPER_SIZE / 2.0 - finger_width + self.GRIPPER_SIZE / 2.0],
+                [gripper_offset + self.GRIPPER_SIZE, -self.GRIPPER_SIZE / 2.0],
+                [gripper_offset, -self.GRIPPER_SIZE / 2.0],
+                [gripper_offset, self.GRIPPER_SIZE / 2.0],
+                [gripper_offset + self.GRIPPER_SIZE, self.GRIPPER_SIZE / 2.0],
+                [gripper_offset + self.GRIPPER_SIZE, half_gap],
+                [gripper_offset, half_gap],
+                [gripper_offset, -self.GRIPPER_SIZE / 2.0],
+            ]) @ R.T)
         
             self.patches_robots[rid].xy = xy_robot
             self.patches_grippers[rid].xy = xy_gripper
 
             self.patches_robots[rid].set_facecolor(self.leds[rid])
+
+            # Color gripper based on state
+            if self.gripper_states[rid] == self.GRIPPER_CLOSED:
+                self.patches_grippers[rid].set_facecolor('red')
+            else:
+                self.patches_grippers[rid].set_facecolor('green')
 
             self.text_ids[rid].set_position((self.states[rid][0] + max(self.ROBOT_SIZE) / 2.0, self.states[rid][1] + max(self.ROBOT_SIZE) / 2.0))
 
@@ -170,6 +227,32 @@ class MultiRoboMasterSim(Node):
     def led_callback(self, msg, rid):
         # Store commanded velocities
         self.leds[rid] = np.array([msg.r, msg.g, msg.b])
+
+    def arm_callback(self, msg, rid):
+        # Store arm target position (x forward extension, z height — y ignored)
+        self.arm_positions[rid] = np.array([msg.x, msg.y, msg.z])
+        self.get_logger().debug(f'Robot {rid} arm target: x={msg.x:.3f}, z={msg.z:.3f}')
+
+    def gripper_execute_callback(self, goal_handle, rid):
+        """Execute a GripperControl action — simulates gripper open/close."""
+        target_state = goal_handle.request.target_state
+        power = goal_handle.request.power
+
+        state_str = 'Closed' if target_state == self.GRIPPER_CLOSED else 'Open'
+        self.get_logger().info(
+            f'Robot {rid} gripper command: {state_str} (power={power:.2f})')
+
+        # Simulate gripper movement delay proportional to power (faster = more power)
+        delay = max(0.3, 1.0 - power)  # 0.3s to 1.0s depending on power
+        time.sleep(delay)
+
+        # Update gripper state
+        self.gripper_states[rid] = target_state
+
+        goal_handle.succeed()
+        result = GripperControl.Result()
+        self.get_logger().info(f'Robot {rid} gripper now: {state_str}')
+        return result
         
     def update_and_publish(self):
         current_time = self.get_clock().now()
